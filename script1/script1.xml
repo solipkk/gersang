@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="EUC-KR"?>
+<ROOT>
+    <MAIN>
+        <ScriptName>script1</ScriptName>
+        <ScriptPath>script1</ScriptPath>
+        <XmlVersion>1.112</XmlVersion>
+        <Cmy>1025</Cmy>
+        <AuthorID>test</AuthorID>
+        <Gid>1</Gid>
+        <Hotkey0>F7</Hotkey0>
+        <Modifiers0>0</Modifiers0>
+        <Vk0>118</Vk0>
+        <Hotkey1>F8</Hotkey1>
+        <Modifiers1>0</Modifiers1>
+        <Vk1>119</Vk1>
+        <Hotkey2>F9</Hotkey2>
+        <Modifiers2>0</Modifiers2>
+        <Vk2>120</Vk2>
+    </MAIN>
+    <TW>
+        <CheckTWInc>0</CheckTWInc>
+        <CheckTWHide>0</CheckTWHide>
+        <TWAName/>
+        <TWAClass/>
+        <TWBName/>
+        <TWBClass/>
+        <TWCName/>
+        <TWCClass/>
+        <TWInc/>
+    </TW>
+    <GENERAL>
+        <CaptureMode>1</CaptureMode>
+        <ReactSpeed>1</ReactSpeed>
+        <InputType>1</InputType>
+        <ImageCount>0</ImageCount>
+    </GENERAL>
+</ROOT>
