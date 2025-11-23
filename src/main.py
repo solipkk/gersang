@@ -39,14 +39,32 @@ def print_matches(matches: Iterable[TemplateMatchResult]) -> None:
         )
 
 
-def load_webhook_config(path: Path = Path("config.json")) -> str:
-    if not path.exists():
-        return ""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return ""
-    return data.get("webhook_url", "")
+def load_webhook_config(path: Path = Path("config.json"), profiles_dir: Path = Path("profiles")) -> str:
+    active_profile = None
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = {}
+        active_profile = data.get("active_profile")
+        if data.get("webhook_url"):
+            return data["webhook_url"]
+
+    profile_candidates = []
+    if active_profile:
+        profile_candidates.append(profiles_dir / f"{active_profile}.json")
+    profile_candidates.append(profiles_dir / "default.json")
+
+    for profile_path in profile_candidates:
+        if not profile_path.exists():
+            continue
+        try:
+            profile_data = json.loads(profile_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if profile_data.get("webhook_url"):
+            return profile_data["webhook_url"]
+    return ""
 
 
 def run_ocr(region: tuple[int, int, int, int], numeric: bool = False) -> None:

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+import time
 from pathlib import Path
 
 import keyboard
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from core.watchdog import WatchdogConfig, WatchdogThread
 from utils.notifier import Notifier
+from ui.overlay import OverlayWidget
 
 CONFIG_PATH = Path("config.json")
 DEFAULT_THRESHOLD = 0.85
@@ -41,53 +44,114 @@ class TargetSetting:
 
 
 @dataclass
+class OverlaySettings:
+    enabled: bool = False
+    position: str = "top_right"
+
+    def to_dict(self) -> dict:
+        return {"enabled": self.enabled, "position": self.position}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "OverlaySettings":
+        if not isinstance(data, dict):
+            return cls()
+        return cls(enabled=bool(data.get("enabled", False)), position=data.get("position", "top_right"))
+
+
+@dataclass
 class AppSettings:
-    targets: list[TargetSetting]
+    targets: list[TargetSetting] = field(default_factory=list)
     start_hotkey: str = "F9"
     stop_hotkey: str = "F10"
     webhook_url: str = ""
+    watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
+    overlay: OverlaySettings = field(default_factory=OverlaySettings)
 
+    def to_dict(self) -> dict:
+        return {
+            "targets": [target.to_dict() for target in self.targets],
+            "hotkeys": {
+                "start": self.start_hotkey,
+                "stop": self.stop_hotkey,
+            },
+            "webhook_url": self.webhook_url,
+            "watchdog": self.watchdog.__dict__,
+            "overlay": self.overlay.to_dict(),
+        }
 
-class ConfigManager:
-    def __init__(self, path: Path = CONFIG_PATH) -> None:
-        self.path = path
-
-    def load(self) -> AppSettings:
-        if not self.path.exists():
-            return AppSettings(targets=[])
-
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            return AppSettings(targets=[])
+    @classmethod
+    def from_dict(cls, data: dict) -> "AppSettings":
+        if not isinstance(data, dict):
+            return cls()
 
         targets: list[TargetSetting] = []
-        for entry in raw.get("targets", []):
+        for entry in data.get("targets", []):
             try:
                 targets.append(TargetSetting.from_dict(entry))
             except (KeyError, TypeError, ValueError):
                 continue
 
-        hotkeys = raw.get("hotkeys", {})
-        start_hotkey = hotkeys.get("start", "F9")
-        stop_hotkey = hotkeys.get("stop", "F10")
+        hotkeys = data.get("hotkeys", {})
+        watchdog_data = data.get("watchdog", {}) or {}
+        overlay_data = data.get("overlay", {}) or {}
 
-        webhook_url = raw.get("webhook_url", "")
-
-        return AppSettings(
-            targets=targets, start_hotkey=start_hotkey, stop_hotkey=stop_hotkey, webhook_url=webhook_url
+        return cls(
+            targets=targets,
+            start_hotkey=hotkeys.get("start", "F9"),
+            stop_hotkey=hotkeys.get("stop", "F10"),
+            webhook_url=data.get("webhook_url", ""),
+            watchdog=WatchdogConfig(
+                process_name=watchdog_data.get("process_name", ""),
+                process_path=watchdog_data.get("process_path", ""),
+                hang_timeout_minutes=int(watchdog_data.get("hang_timeout_minutes", 5)),
+            ),
+            overlay=OverlaySettings.from_dict(overlay_data),
         )
 
-    def save(self, settings: AppSettings) -> None:
-        payload = {
-            "targets": [target.to_dict() for target in settings.targets],
-            "hotkeys": {
-                "start": settings.start_hotkey,
-                "stop": settings.stop_hotkey,
-            },
-            "webhook_url": settings.webhook_url,
-        }
+
+class ConfigManager:
+    def __init__(self, path: Path = CONFIG_PATH, profiles_dir: Path = Path("profiles")) -> None:
+        self.path = path
+        self.profiles_dir = profiles_dir
+        self.profiles_dir.mkdir(exist_ok=True)
+
+    def load_metadata(self) -> tuple[str, bool]:
+        if not self.path.exists():
+            return "default", False
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return "default", False
+        return raw.get("active_profile", "default"), bool(raw.get("auto_save", False))
+
+    def save_metadata(self, active_profile: str, auto_save: bool) -> None:
+        payload = {"active_profile": active_profile, "auto_save": auto_save}
         self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def available_profiles(self) -> list[str]:
+        return sorted([p.stem for p in self.profiles_dir.glob("*.json")])
+
+    def _profile_path(self, name: str) -> Path:
+        return self.profiles_dir / f"{name}.json"
+
+    def load_profile(self, name: str) -> AppSettings:
+        profile_path = self._profile_path(name)
+        if not profile_path.exists():
+            return AppSettings()
+        try:
+            data = json.loads(profile_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return AppSettings()
+        return AppSettings.from_dict(data)
+
+    def save_profile(self, name: str, settings: AppSettings) -> None:
+        payload = settings.to_dict()
+        self._profile_path(name).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def delete_profile(self, name: str) -> None:
+        profile_path = self._profile_path(name)
+        if profile_path.exists():
+            profile_path.unlink()
 
 
 class TargetListWidget(QtWidgets.QListWidget):
@@ -100,20 +164,37 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("PyRPA – Target Manager")
-        self.resize(900, 620)
+        self.resize(980, 700)
 
         self.config_manager = ConfigManager()
-        settings = self.config_manager.load()
+        self.active_profile, self.auto_save = self.config_manager.load_metadata()
+        settings = self.config_manager.load_profile(self.active_profile)
+        # Ensure the active profile exists on disk for discoverability
+        self.config_manager.save_profile(self.active_profile, settings)
+
         self.targets: list[TargetSetting] = list(settings.targets)
         self.start_hotkey = settings.start_hotkey
         self.stop_hotkey = settings.stop_hotkey
         self.webhook_url = settings.webhook_url
+        self.watchdog_settings = settings.watchdog
+        self.overlay_settings = settings.overlay
+
         self.hotkey_handles: list[str] = []
         self.is_running = False
+        self.settings_dirty = False
+        self.run_start_time: float | None = None
+        self.last_log_line = ""
+        self.loading_profile = False
+
+        self.watchdog_thread: WatchdogThread | None = None
+        self.overlay_widget: OverlayWidget | None = None
 
         self._build_ui()
         self._load_targets_into_list()
+        self._apply_settings_to_ui(settings)
         self._register_hotkeys()
+        self._refresh_watchdog_thread()
+        self._ensure_overlay()
 
     # UI construction -----------------------------------------------------
     def _build_ui(self) -> None:
@@ -122,13 +203,37 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(12)
 
+        layout.addLayout(self._build_profile_section())
         layout.addLayout(self._build_target_section())
         layout.addWidget(self._build_settings_section())
         layout.addWidget(self._build_control_section())
+        layout.addWidget(self._build_watchdog_section())
         layout.addWidget(self._build_notification_section())
         layout.addWidget(self._build_log_section())
 
         self.setCentralWidget(central)
+
+    def _build_profile_section(self) -> QtWidgets.QLayout:
+        layout = QtWidgets.QHBoxLayout()
+        layout.addWidget(QtWidgets.QLabel("Profile:"))
+
+        self.profile_combo = QtWidgets.QComboBox()
+        self.profile_combo.currentTextChanged.connect(self._on_profile_changed)
+        layout.addWidget(self.profile_combo, 2)
+
+        new_btn = QtWidgets.QPushButton("New")
+        new_btn.clicked.connect(self._create_profile)
+        delete_btn = QtWidgets.QPushButton("Delete")
+        delete_btn.clicked.connect(self._delete_profile)
+        save_btn = QtWidgets.QPushButton("Save")
+        save_btn.clicked.connect(self._save_profile)
+        self.auto_save_box = QtWidgets.QCheckBox("Auto-save changes")
+        self.auto_save_box.stateChanged.connect(self._toggle_auto_save)
+
+        for widget in (new_btn, delete_btn, save_btn, self.auto_save_box):
+            layout.addWidget(widget)
+
+        return layout
 
     def _build_target_section(self) -> QtWidgets.QLayout:
         container = QtWidgets.QHBoxLayout()
@@ -210,6 +315,43 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addStretch(1)
         return panel
 
+    def _build_watchdog_section(self) -> QtWidgets.QGroupBox:
+        group = QtWidgets.QGroupBox("Watchdog & Overlay")
+        form = QtWidgets.QFormLayout(group)
+
+        self.process_name_field = QtWidgets.QLineEdit()
+        self.process_name_field.setPlaceholderText("game.exe")
+        self.process_name_field.editingFinished.connect(self._on_watchdog_changed)
+        form.addRow("Process name", self.process_name_field)
+
+        path_row = QtWidgets.QHBoxLayout()
+        self.process_path_field = QtWidgets.QLineEdit()
+        browse = QtWidgets.QPushButton("Browse…")
+        browse.clicked.connect(self._browse_process_path)
+        path_row.addWidget(self.process_path_field)
+        path_row.addWidget(browse)
+        form.addRow("Executable path", path_row)
+
+        self.hang_timeout_spin = QtWidgets.QSpinBox()
+        self.hang_timeout_spin.setRange(1, 120)
+        self.hang_timeout_spin.setSuffix(" min")
+        self.hang_timeout_spin.valueChanged.connect(self._on_watchdog_changed)
+        form.addRow("Hang timeout", self.hang_timeout_spin)
+
+        overlay_row = QtWidgets.QHBoxLayout()
+        self.overlay_checkbox = QtWidgets.QCheckBox("Show overlay HUD")
+        self.overlay_checkbox.stateChanged.connect(self._toggle_overlay)
+        self.overlay_position = QtWidgets.QComboBox()
+        self.overlay_position.addItems(["top_right", "top_left"])
+        self.overlay_position.currentTextChanged.connect(self._on_overlay_position_changed)
+        overlay_row.addWidget(self.overlay_checkbox)
+        overlay_row.addWidget(QtWidgets.QLabel("Position"))
+        overlay_row.addWidget(self.overlay_position)
+        overlay_row.addStretch(1)
+        form.addRow("Overlay", overlay_row)
+
+        return group
+
     def _build_notification_section(self) -> QtWidgets.QGroupBox:
         group = QtWidgets.QGroupBox("Notifications")
         form = QtWidgets.QFormLayout(group)
@@ -233,6 +375,62 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log_console.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
         vbox.addWidget(self.log_console)
         return group
+
+    # Settings hydration --------------------------------------------------
+    def _populate_profiles(self) -> None:
+        profiles = self.config_manager.available_profiles()
+        if self.active_profile not in profiles:
+            profiles.insert(0, self.active_profile)
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        self.profile_combo.addItems(profiles)
+        current_index = self.profile_combo.findText(self.active_profile)
+        self.profile_combo.setCurrentIndex(max(0, current_index))
+        self.profile_combo.blockSignals(False)
+
+    def _apply_settings_to_ui(self, settings: AppSettings) -> None:
+        self._populate_profiles()
+        self.loading_profile = True
+        self.targets = list(settings.targets)
+        self._load_targets_into_list()
+
+        self.start_hotkey = settings.start_hotkey
+        self.stop_hotkey = settings.stop_hotkey
+        self.webhook_url = settings.webhook_url
+        self.watchdog_settings = settings.watchdog
+        self.overlay_settings = settings.overlay
+
+        self.is_running = False
+        self.run_start_time = None
+        self.last_log_line = ""
+
+        self.status_label.setText("Status: idle")
+        self.hotkey_label.setText(f"Start: {self.start_hotkey}  |  Stop: {self.stop_hotkey} (global)")
+        self.start_button.setText(f"Start ({self.start_hotkey})")
+        self.stop_button.setText(f"Stop ({self.stop_hotkey})")
+        self.webhook_field.setText(self.webhook_url)
+
+        self.process_name_field.setText(self.watchdog_settings.process_name)
+        self.process_path_field.setText(self.watchdog_settings.process_path)
+        self.hang_timeout_spin.blockSignals(True)
+        self.hang_timeout_spin.setValue(int(self.watchdog_settings.hang_timeout_minutes))
+        self.hang_timeout_spin.blockSignals(False)
+
+        self.overlay_checkbox.blockSignals(True)
+        self.overlay_checkbox.setChecked(self.overlay_settings.enabled)
+        self.overlay_checkbox.blockSignals(False)
+        position_index = self.overlay_position.findText(self.overlay_settings.position)
+        self.overlay_position.blockSignals(True)
+        self.overlay_position.setCurrentIndex(max(0, position_index))
+        self.overlay_position.blockSignals(False)
+
+        self.auto_save_box.blockSignals(True)
+        self.auto_save_box.setChecked(self.auto_save)
+        self.auto_save_box.blockSignals(False)
+
+        self.settings_dirty = False
+        self._update_title_dirty()
+        self.loading_profile = False
 
     # Target list helpers --------------------------------------------------
     def _load_targets_into_list(self) -> None:
@@ -277,7 +475,7 @@ class MainWindow(QtWidgets.QMainWindow):
             item.setData(QtCore.Qt.UserRole, target)
             self.target_list.addItem(item)
             self.target_list.setCurrentItem(item)
-            self._persist_settings()
+            self._mark_dirty()
             self._append_log(f"Added target: {target.image_path}")
 
     def _remove_target(self) -> None:
@@ -286,7 +484,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         removed = self.targets.pop(selected)
         self.target_list.takeItem(selected)
-        self._persist_settings()
+        self._mark_dirty()
         self._append_log(f"Removed target: {removed.image_path}")
         if self.targets:
             self.target_list.setCurrentRow(max(0, selected - 1))
@@ -304,7 +502,7 @@ class MainWindow(QtWidgets.QMainWindow):
         item = self.target_list.takeItem(selected)
         self.target_list.insertItem(new_index, item)
         self.target_list.setCurrentRow(new_index)
-        self._persist_settings()
+        self._mark_dirty()
         self._append_log("Reordered targets")
 
     def _on_target_selected(
@@ -332,7 +530,7 @@ class MainWindow(QtWidgets.QMainWindow):
         target_index, target = selection
         target.action = self.action_combo.itemData(index)
         self._refresh_item_text(target_index)
-        self._persist_settings()
+        self._mark_dirty()
 
     def _on_threshold_changed(self, value: int) -> None:
         selection = self._selected_target()
@@ -342,7 +540,7 @@ class MainWindow(QtWidgets.QMainWindow):
         target.threshold = round(value / 100.0, 2)
         self.threshold_label.setText(f"{target.threshold:.2f}")
         self._refresh_item_text(target_index)
-        self._persist_settings()
+        self._mark_dirty()
 
     def _clear_settings_panel(self) -> None:
         self._set_settings_enabled(False)
@@ -363,6 +561,10 @@ class MainWindow(QtWidgets.QMainWindow):
             keyboard.remove_hotkey(handle)
         self.hotkey_handles.clear()
 
+    def _reset_hotkeys(self) -> None:
+        self._unregister_hotkeys()
+        self._register_hotkeys()
+
     # Macro control --------------------------------------------------------
     def _handle_start(self) -> None:
         if self.is_running:
@@ -372,6 +574,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.is_running = True
         self.status_label.setText("Status: running")
+        self.run_start_time = time.monotonic()
+        self._update_overlay_content("running")
         self._append_log("Macro started.")
 
     def _handle_stop(self) -> None:
@@ -379,33 +583,52 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.is_running = False
         self.status_label.setText("Status: idle")
+        self.run_start_time = None
+        self._update_overlay_content("idle")
         self._append_log("Macro stopped.")
 
     # Persistence ----------------------------------------------------------
-    def _persist_settings(self) -> None:
-        self.config_manager.save(self._current_settings())
-
     def _current_settings(self) -> AppSettings:
         return AppSettings(
             targets=list(self.targets),
             start_hotkey=self.start_hotkey,
             stop_hotkey=self.stop_hotkey,
             webhook_url=self.webhook_url,
+            watchdog=self.watchdog_settings,
+            overlay=self.overlay_settings,
         )
+
+    def _save_profile(self) -> None:
+        settings = self._current_settings()
+        self.config_manager.save_profile(self.active_profile, settings)
+        self.config_manager.save_metadata(self.active_profile, self.auto_save)
+        self.settings_dirty = False
+        self._update_title_dirty()
+        self._append_log(f"Profile '{self.active_profile}' saved.")
+
+    def _mark_dirty(self) -> None:
+        if getattr(self, "loading_profile", False):
+            return
+        self.settings_dirty = True
+        self._update_title_dirty()
+        if self.auto_save:
+            self._save_profile()
 
     # Logging --------------------------------------------------------------
     def _append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_console.appendPlainText(f"[{timestamp}] {message}")
+        line = f"[{timestamp}] {message}"
+        self.last_log_line = message
+        self.log_console.appendPlainText(line)
         self.log_console.verticalScrollBar().setValue(self.log_console.verticalScrollBar().maximum())
+        if self.watchdog_thread:
+            self.watchdog_thread.report_activity()
+        self._update_overlay_content(state=None)
 
     def _on_webhook_changed(self) -> None:
         self.webhook_url = self.webhook_field.text().strip()
-        self._persist_settings()
-        if self.webhook_url:
-            self._append_log("Webhook URL saved.")
-        else:
-            self._append_log("Webhook URL cleared.")
+        self._mark_dirty()
+        self._append_log("Webhook URL updated.")
 
     def _send_test_webhook(self) -> None:
         notifier = Notifier(self.webhook_url)
@@ -417,9 +640,150 @@ class MainWindow(QtWidgets.QMainWindow):
         action_label = ACTION_CHOICES.get(target.action, target.action)
         return f"{target.image_path.name} • {action_label} • {target.threshold:.2f}"
 
+    def _update_title_dirty(self) -> None:
+        suffix = " *" if self.settings_dirty and not self.auto_save else ""
+        self.setWindowTitle(f"PyRPA – Target Manager{suffix}")
+
+    def _update_overlay_content(self, state: str | None) -> None:
+        if not self.overlay_settings.enabled:
+            return
+        self._ensure_overlay()
+        if not self.overlay_widget:
+            return
+        overlay_state = state or ("running" if self.is_running else "idle")
+        self.overlay_widget.set_state(overlay_state.title())
+        self.overlay_widget.set_start_time(self.run_start_time if self.run_start_time else time.monotonic())
+        self.overlay_widget.set_last_log(self.last_log_line or "Ready")
+
+    def _ensure_overlay(self) -> None:
+        if not self.overlay_settings.enabled:
+            if self.overlay_widget:
+                self.overlay_widget.hide()
+            return
+        if self.overlay_widget is None:
+            self.overlay_widget = OverlayWidget(self.overlay_settings.position)
+        else:
+            self.overlay_widget.set_position(self.overlay_settings.position)
+        self.overlay_widget.set_state("Running" if self.is_running else "Idle")
+        if self.run_start_time:
+            self.overlay_widget.set_start_time(self.run_start_time)
+        self.overlay_widget.set_last_log(self.last_log_line or "Ready")
+        self.overlay_widget.show()
+
+    def _refresh_watchdog_thread(self) -> None:
+        if self.watchdog_thread:
+            self.watchdog_thread.stop()
+            self.watchdog_thread.wait()
+            self.watchdog_thread = None
+        if not (self.watchdog_settings.process_name or self.watchdog_settings.process_path):
+            return
+        self.watchdog_thread = WatchdogThread(self.watchdog_settings)
+        self.watchdog_thread.status.connect(self._append_log)
+        self.watchdog_thread.restarted.connect(lambda path: self._append_log(f"Restarted: {path}"))
+        self.watchdog_thread.killed.connect(lambda name: self._append_log(f"Killed hung process: {name}"))
+        self.watchdog_thread.start()
+
+    # Watchdog / overlay handlers ----------------------------------------
+    def _on_watchdog_changed(self) -> None:
+        if getattr(self, "loading_profile", False):
+            return
+        self.watchdog_settings = WatchdogConfig(
+            process_name=self.process_name_field.text().strip(),
+            process_path=self.process_path_field.text().strip(),
+            hang_timeout_minutes=int(self.hang_timeout_spin.value()),
+        )
+        self._mark_dirty()
+        self._refresh_watchdog_thread()
+
+    def _browse_process_path(self) -> None:
+        dialog = QtWidgets.QFileDialog(self, "Select executable")
+        dialog.setFileMode(QtWidgets.QFileDialog.ExistingFile)
+        if dialog.exec() == QtWidgets.QDialog.Accepted:
+            selected = dialog.selectedFiles()[0]
+            self.process_path_field.setText(selected)
+            self._on_watchdog_changed()
+
+    def _toggle_overlay(self) -> None:
+        if getattr(self, "loading_profile", False):
+            return
+        self.overlay_settings.enabled = self.overlay_checkbox.isChecked()
+        self._mark_dirty()
+        self._ensure_overlay()
+
+    def _on_overlay_position_changed(self, value: str) -> None:
+        if getattr(self, "loading_profile", False):
+            return
+        self.overlay_settings.position = value
+        if self.overlay_widget:
+            self.overlay_widget.set_position(value)
+        self._mark_dirty()
+
+    # Profile management ---------------------------------------------------
+    def _toggle_auto_save(self, state: int) -> None:
+        if getattr(self, "loading_profile", False):
+            return
+        self.auto_save = state == QtCore.Qt.Checked
+        self.config_manager.save_metadata(self.active_profile, self.auto_save)
+        if self.auto_save and self.settings_dirty:
+            self._save_profile()
+        self._update_title_dirty()
+
+    def _on_profile_changed(self, profile: str) -> None:
+        if not profile or profile == self.active_profile:
+            return
+        if self.settings_dirty and not self.auto_save:
+            # keep unsaved changes by staying on current profile
+            self.profile_combo.blockSignals(True)
+            self.profile_combo.setCurrentText(self.active_profile)
+            self.profile_combo.blockSignals(False)
+            return
+        self.active_profile = profile
+        settings = self.config_manager.load_profile(profile)
+        self.config_manager.save_metadata(self.active_profile, self.auto_save)
+        self._apply_settings_to_ui(settings)
+        self._reset_hotkeys()
+        self._refresh_watchdog_thread()
+        self._ensure_overlay()
+
+    def _create_profile(self) -> None:
+        name, ok = QtWidgets.QInputDialog.getText(self, "New profile", "Profile name")
+        if not ok or not name.strip():
+            return
+        profile_name = name.strip()
+        self.active_profile = profile_name
+        default_settings = AppSettings()
+        self.config_manager.save_profile(profile_name, default_settings)
+        self.config_manager.save_metadata(self.active_profile, self.auto_save)
+        self._apply_settings_to_ui(default_settings)
+        self._reset_hotkeys()
+        self._refresh_watchdog_thread()
+        self._ensure_overlay()
+
+    def _delete_profile(self) -> None:
+        if self.profile_combo.count() <= 1:
+            self._append_log("Cannot delete the last profile.")
+            return
+        name = self.profile_combo.currentText()
+        if not name:
+            return
+        self.config_manager.delete_profile(name)
+        remaining = [p for p in self.config_manager.available_profiles() if p != name]
+        self.active_profile = remaining[0] if remaining else "default"
+        settings = self.config_manager.load_profile(self.active_profile)
+        self.config_manager.save_metadata(self.active_profile, self.auto_save)
+        self._apply_settings_to_ui(settings)
+        self._reset_hotkeys()
+        self._refresh_watchdog_thread()
+        self._ensure_overlay()
+
+    # Lifecycle ------------------------------------------------------------
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # pragma: no cover - Qt hook
-        self._persist_settings()
+        if self.auto_save:
+            self._save_profile()
         self._unregister_hotkeys()
+        if self.watchdog_thread:
+            self.watchdog_thread.stop()
+            self.watchdog_thread.wait()
         super().closeEvent(event)
 
 
