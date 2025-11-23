@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import random
 import time
+import math
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, List, Tuple
 
 import pydirectinput
 
@@ -27,7 +28,9 @@ class InputHandler:
         delay = base if base is not None else random.uniform(self.timings.min_delay, self.timings.max_delay)
         time.sleep(delay)
 
-    def _bezier_path(self, start: tuple[int, int], end: tuple[int, int], steps: int) -> Iterable[tuple[int, int]]:
+    def _bezier_path(
+        self, start: tuple[int, int], end: tuple[int, int], steps: int, jitter: int = 2
+    ) -> Iterable[tuple[int, int]]:
         dx = end[0] - start[0]
         dy = end[1] - start[1]
         ctrl1 = (
@@ -53,14 +56,38 @@ class InputHandler:
                 + 3 * (1 - t) * t**2 * ctrl2[1]
                 + t**3 * end[1]
             )
+            x += random.randint(-jitter, jitter)
+            y += random.randint(-jitter, jitter)
             yield x, y
 
     def move_mouse(self, x: int, y: int, duration: float = 0.35) -> None:
         start = pydirectinput.position()
-        steps = max(int(duration * 1000 / self.timings.mouse_step_ms), 8)
-        for point in self._bezier_path(start, (x, y), steps):
+        end = (x, y)
+        overshoot_points: List[Tuple[int, int]] = []
+        if random.random() < 0.25:
+            overshoot = (
+                end[0] + random.randint(-20, 20),
+                end[1] + random.randint(-20, 20),
+            )
+            overshoot_points.append(overshoot)
+
+        steps = max(int(duration * 1000 / self.timings.mouse_step_ms), 12)
+        path: list[tuple[int, int]] = []
+        current_start = start
+        for idx, target in enumerate([*overshoot_points, end]):
+            part_steps = max(steps // (len(overshoot_points) + 1), 8)
+            jitter = 3 if idx == 0 and overshoot_points else 2
+            path.extend(list(self._bezier_path(current_start, target, part_steps, jitter=jitter)))
+            current_start = target
+
+        total_points = len(path)
+        for i, point in enumerate(path, start=1):
             pydirectinput.moveTo(point[0], point[1])
-            self._human_delay(self.timings.mouse_step_ms / 1000.0)
+            t = i / max(total_points, 1)
+            ease = 0.5 - 0.5 * math.cos(math.pi * t)
+            base_delay = self.timings.mouse_step_ms / 1000.0
+            variable = random.uniform(0.6, 1.4)
+            self._human_delay(base_delay * ease * variable)
 
     def click(self, x: int, y: int, button: str = "left") -> None:
         self.move_mouse(x, y)

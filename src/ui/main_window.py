@@ -8,6 +8,8 @@ from pathlib import Path
 import keyboard
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from utils.notifier import Notifier
+
 CONFIG_PATH = Path("config.json")
 DEFAULT_THRESHOLD = 0.85
 ACTION_CHOICES = {
@@ -43,6 +45,7 @@ class AppSettings:
     targets: list[TargetSetting]
     start_hotkey: str = "F9"
     stop_hotkey: str = "F10"
+    webhook_url: str = ""
 
 
 class ConfigManager:
@@ -69,7 +72,11 @@ class ConfigManager:
         start_hotkey = hotkeys.get("start", "F9")
         stop_hotkey = hotkeys.get("stop", "F10")
 
-        return AppSettings(targets=targets, start_hotkey=start_hotkey, stop_hotkey=stop_hotkey)
+        webhook_url = raw.get("webhook_url", "")
+
+        return AppSettings(
+            targets=targets, start_hotkey=start_hotkey, stop_hotkey=stop_hotkey, webhook_url=webhook_url
+        )
 
     def save(self, settings: AppSettings) -> None:
         payload = {
@@ -78,6 +85,7 @@ class ConfigManager:
                 "start": settings.start_hotkey,
                 "stop": settings.stop_hotkey,
             },
+            "webhook_url": settings.webhook_url,
         }
         self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -99,6 +107,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.targets: list[TargetSetting] = list(settings.targets)
         self.start_hotkey = settings.start_hotkey
         self.stop_hotkey = settings.stop_hotkey
+        self.webhook_url = settings.webhook_url
         self.hotkey_handles: list[str] = []
         self.is_running = False
 
@@ -116,6 +125,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(self._build_target_section())
         layout.addWidget(self._build_settings_section())
         layout.addWidget(self._build_control_section())
+        layout.addWidget(self._build_notification_section())
         layout.addWidget(self._build_log_section())
 
         self.setCentralWidget(central)
@@ -199,6 +209,21 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(action_layout, 0)
         layout.addStretch(1)
         return panel
+
+    def _build_notification_section(self) -> QtWidgets.QGroupBox:
+        group = QtWidgets.QGroupBox("Notifications")
+        form = QtWidgets.QFormLayout(group)
+
+        self.webhook_field = QtWidgets.QLineEdit(self.webhook_url)
+        self.webhook_field.setPlaceholderText("Discord webhook URL")
+        self.webhook_field.editingFinished.connect(self._on_webhook_changed)
+        form.addRow("Webhook URL", self.webhook_field)
+
+        test_button = QtWidgets.QPushButton("Send test message")
+        test_button.clicked.connect(self._send_test_webhook)
+        form.addRow("", test_button)
+
+        return group
 
     def _build_log_section(self) -> QtWidgets.QGroupBox:
         group = QtWidgets.QGroupBox("Log console")
@@ -361,13 +386,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.config_manager.save(self._current_settings())
 
     def _current_settings(self) -> AppSettings:
-        return AppSettings(targets=list(self.targets), start_hotkey=self.start_hotkey, stop_hotkey=self.stop_hotkey)
+        return AppSettings(
+            targets=list(self.targets),
+            start_hotkey=self.start_hotkey,
+            stop_hotkey=self.stop_hotkey,
+            webhook_url=self.webhook_url,
+        )
 
     # Logging --------------------------------------------------------------
     def _append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_console.appendPlainText(f"[{timestamp}] {message}")
         self.log_console.verticalScrollBar().setValue(self.log_console.verticalScrollBar().maximum())
+
+    def _on_webhook_changed(self) -> None:
+        self.webhook_url = self.webhook_field.text().strip()
+        self._persist_settings()
+        if self.webhook_url:
+            self._append_log("Webhook URL saved.")
+        else:
+            self._append_log("Webhook URL cleared.")
+
+    def _send_test_webhook(self) -> None:
+        notifier = Notifier(self.webhook_url)
+        notifier.send_message("PyRPA test message: webhook configured")
+        self._append_log("Test webhook sent (check Discord).")
 
     # Utility --------------------------------------------------------------
     def _format_target_label(self, target: TargetSetting) -> str:

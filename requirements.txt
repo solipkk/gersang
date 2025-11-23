@@ -5,3 +5,4 @@ pydirectinput==1.0.4
 mss==9.0.1
 requests==2.31.0
 keyboard==0.13.5
+easyocr==1.7.1
