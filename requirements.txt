@@ -8,3 +8,4 @@ keyboard==0.13.5
 easyocr==1.7.1
 psutil==5.9.8
 pywin32==306
+dxcam==0.0.5

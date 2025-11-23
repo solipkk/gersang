@@ -9,6 +9,7 @@ import numpy as np
 from PySide6 import QtCore
 
 from core import window_manager
+from core.safety_lock import SafetyLock
 
 ActionCallback = Callable[[window_manager.WindowInfo, int], None]
 
@@ -31,12 +32,14 @@ class SchedulerThread(QtCore.QThread):
         windows: Iterable[window_manager.WindowInfo],
         settings: SchedulerSettings,
         action_callback: ActionCallback | None = None,
+        safety_lock: SafetyLock | None = None,
         parent: QtCore.QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self.windows: List[window_manager.WindowInfo] = window_manager.filter_windows(list(windows))
         self.settings = settings
         self.action_callback = action_callback
+        self.safety_lock = safety_lock
         self._running = True
 
     def stop(self) -> None:
@@ -63,9 +66,15 @@ class SchedulerThread(QtCore.QThread):
                         continue
 
                     time.sleep(max(0.0, self.settings.switch_delay))
-                    if not self._wait_for_render(sct, info, idx):
+                    frame = self._wait_for_render(sct, info, idx)
+                    if frame is None:
                         self.render_timeout.emit(idx, info.title)
                         continue
+
+                    if self.safety_lock and self.safety_lock.evaluate(frame, info.title, idx):
+                        self.log.emit("Safety lock engaged; stopping scheduler.")
+                        self._running = False
+                        break
 
                     if self.action_callback:
                         try:
@@ -74,6 +83,15 @@ class SchedulerThread(QtCore.QThread):
                             self.log.emit(f"Action error on {info.title}: {exc}")
 
                     time.sleep(max(0.0, self.settings.action_delay))
+
+                    if self.safety_lock:
+                        remote_cmd = self.safety_lock.poll_remote()
+                        if remote_cmd == "stop":
+                            self.log.emit("Remote stop received; aborting scheduler")
+                            self._running = False
+                            break
+                        if remote_cmd == "resume":
+                            self.log.emit("Remote resume acknowledged; continuing")
 
         self.finished.emit()
 
@@ -84,13 +102,15 @@ class SchedulerThread(QtCore.QThread):
             return
         self.window_removed.emit(idx, info.title)
 
-    def _wait_for_render(self, sct: mss.base.MSSBase, info: window_manager.WindowInfo, idx: int) -> bool:
+    def _wait_for_render(
+        self, sct: mss.base.MSSBase, info: window_manager.WindowInfo, idx: int
+    ) -> np.ndarray | None:
         deadline = time.time() + 1.0
         while self._running and time.time() < deadline:
             rect = window_manager.get_window_rect(info.hwnd)
             if rect is None:
                 self._remove_window(idx, info)
-                return False
+                return None
 
             left, top, right, bottom = rect
             width = max(1, right - left)
@@ -105,7 +125,7 @@ class SchedulerThread(QtCore.QThread):
 
             mean_pixel = shot[..., :3].mean()
             if mean_pixel > 5:
-                return True
+                return shot
             time.sleep(0.05)
 
-        return False
+        return None

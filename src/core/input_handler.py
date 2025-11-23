@@ -4,7 +4,7 @@ import math
 import random
 import time
 from dataclasses import dataclass
-from typing import Iterable, List, Tuple
+from typing import Callable, Iterable, List, Tuple
 
 import pydirectinput
 
@@ -26,10 +26,28 @@ class InputTimings:
 class InputHandler:
     """Low-level-friendly input wrapper with human-like timing."""
 
-    def __init__(self, timings: InputTimings | None = None) -> None:
+    def __init__(
+        self,
+        timings: InputTimings | None = None,
+        dry_run: bool = False,
+        logger: Callable[[str], None] | None = None,
+    ) -> None:
         self.timings = timings or InputTimings()
+        self.dry_run = dry_run
+        self.blocked = False
+        self.logger = logger
         pydirectinput.PAUSE = 0
         pydirectinput.FAILSAFE = False
+
+    def set_dry_run(self, enabled: bool) -> None:
+        self.dry_run = enabled
+
+    def set_blocked(self, blocked: bool) -> None:
+        self.blocked = blocked
+
+    def _log(self, message: str) -> None:
+        if self.logger:
+            self.logger(message)
 
     def _gaussian_delay(self, mean: float, std: float, minimum: float = 0.0) -> float:
         delay = max(minimum, random.gauss(mean, std))
@@ -41,6 +59,12 @@ class InputHandler:
         else:
             delay = random.uniform(self.timings.min_delay, self.timings.max_delay)
         time.sleep(delay)
+
+    def _should_block(self) -> bool:
+        if self.blocked:
+            self._log("[Safety] Input blocked; ignoring request.")
+            return True
+        return False
 
     def get_random_point(self, x: int, y: int, w: int, h: int) -> tuple[int, int]:
         cx = x + w / 2
@@ -92,6 +116,8 @@ class InputHandler:
         return duration
 
     def move_mouse(self, x: int, y: int, duration: float | None = None) -> None:
+        if self._should_block():
+            return
         start = pydirectinput.position()
         end = (x, y)
         overshoot_points: List[Tuple[int, int]] = []
@@ -114,7 +140,10 @@ class InputHandler:
 
         total_points = len(path)
         for i, point in enumerate(path, start=1):
-            pydirectinput.moveTo(point[0], point[1])
+            if self.dry_run:
+                self._log(f"[DryRun] Move to {point}")
+            else:
+                pydirectinput.moveTo(point[0], point[1])
             t = i / max(total_points, 1)
             ease = 0.5 - 0.5 * math.cos(math.pi * t)
             base_delay = self.timings.mouse_step_ms / 1000.0
@@ -122,10 +151,22 @@ class InputHandler:
             micro_pause = self._gaussian_delay(base_delay * ease * variable, base_delay * 0.2, minimum=0.001)
             time.sleep(micro_pause)
 
+    def force_move_mouse(self, x: int, y: int) -> None:
+        """Bypass block to clear the cursor on freezes."""
+        try:
+            pydirectinput.moveTo(x, y)
+        except Exception:
+            return
+
     def click(self, x: int, y: int, button: str = "left") -> None:
+        if self._should_block():
+            return
         self.move_mouse(x, y)
         self._human_delay(self._gaussian_delay(self.timings.click_delay_mean, self.timings.click_delay_std, 0.01))
-        pydirectinput.click(button=button)
+        if self.dry_run:
+            self._log(f"[DryRun] Click {button} at ({x}, {y})")
+        else:
+            pydirectinput.click(button=button)
         self._human_delay(self._gaussian_delay(self.timings.click_delay_mean, self.timings.click_delay_std, 0.01))
 
     def click_region(self, x: int, y: int, w: int, h: int, button: str = "left") -> None:
@@ -133,18 +174,36 @@ class InputHandler:
         self.click(rx, ry, button=button)
 
     def tap_key(self, key: str) -> None:
-        pydirectinput.press(key)
+        if self._should_block():
+            return
+        if self.dry_run:
+            self._log(f"[DryRun] Tap key '{key}'")
+        else:
+            pydirectinput.press(key)
         self._human_delay(self._gaussian_delay(self.timings.click_delay_mean, self.timings.click_delay_std, 0.005))
 
     def key_down(self, key: str) -> None:
-        pydirectinput.keyDown(key)
+        if self._should_block():
+            return
+        if self.dry_run:
+            self._log(f"[DryRun] Key down '{key}'")
+        else:
+            pydirectinput.keyDown(key)
         self._human_delay()
 
     def key_up(self, key: str) -> None:
-        pydirectinput.keyUp(key)
+        if self._should_block():
+            return
+        if self.dry_run:
+            self._log(f"[DryRun] Key up '{key}'")
+        else:
+            pydirectinput.keyUp(key)
         self._human_delay()
 
     def type_text(self, text: str, interval_range: tuple[float, float] = (0.02, 0.08)) -> None:
         for char in text:
-            pydirectinput.press(char)
+            if self.dry_run:
+                self._log(f"[DryRun] Type '{char}'")
+            else:
+                pydirectinput.press(char)
             self._human_delay(random.uniform(*interval_range))

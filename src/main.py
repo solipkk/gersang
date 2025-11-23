@@ -120,6 +120,7 @@ def main() -> None:
     parser.add_argument("--rest-interval", type=float, nargs=2, metavar=("MIN", "MAX"), default=(40, 60))
     parser.add_argument("--rest-duration", type=float, nargs=2, metavar=("MIN", "MAX"), default=(1, 5))
     parser.add_argument("--noise-chance", type=float, default=0.015, help="Micro-noise probability per loop")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate inputs without sending them")
     args = parser.parse_args()
 
     if args.ocr_region:
@@ -129,7 +130,7 @@ def main() -> None:
     matcher = TemplateMatcher(
         template_dir=args.templates, threshold=args.threshold, capture_region=_parse_region_dict(args.region)
     )
-    input_handler = InputHandler()
+    input_handler = InputHandler(dry_run=args.dry_run, logger=print)
     notifier = Notifier(load_webhook_config())
 
     if args.click_first:

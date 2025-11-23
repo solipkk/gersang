@@ -10,10 +10,13 @@ import keyboard
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from core.fsm import HumanBehaviorSettings
+from core.input_handler import InputHandler
+from core.safety_lock import SafetyLock
 from core import window_manager
 from core.scheduler import SchedulerSettings, SchedulerThread
 from core.watchdog import WatchdogConfig, WatchdogThread
 from utils.notifier import Notifier
+from utils.telegram_bot import TelegramBot
 from ui.overlay import OverlayWidget
 
 CONFIG_PATH = Path("config.json")
@@ -67,6 +70,9 @@ class AppSettings:
     start_hotkey: str = "F9"
     stop_hotkey: str = "F10"
     webhook_url: str = ""
+    telegram_token: str = ""
+    telegram_chat_id: str = ""
+    dry_run: bool = False
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     overlay: OverlaySettings = field(default_factory=OverlaySettings)
     window_keyword: str = "game"
@@ -81,6 +87,8 @@ class AppSettings:
                 "stop": self.stop_hotkey,
             },
             "webhook_url": self.webhook_url,
+            "telegram": {"token": self.telegram_token, "chat_id": self.telegram_chat_id},
+            "dry_run": self.dry_run,
             "watchdog": self.watchdog.__dict__,
             "overlay": self.overlay.to_dict(),
             "window_manager": {"keyword": self.window_keyword},
@@ -116,12 +124,16 @@ class AppSettings:
         window_manager_data = data.get("window_manager", {}) or {}
         scheduler_data = data.get("scheduler", {}) or {}
         human_behavior = data.get("human_behavior", {}) or {}
+        telegram_data = data.get("telegram", {}) or {}
 
         return cls(
             targets=targets,
             start_hotkey=hotkeys.get("start", "F9"),
             stop_hotkey=hotkeys.get("stop", "F10"),
             webhook_url=data.get("webhook_url", ""),
+            telegram_token=telegram_data.get("token", ""),
+            telegram_chat_id=telegram_data.get("chat_id", ""),
+            dry_run=bool(data.get("dry_run", False)),
             watchdog=WatchdogConfig(
                 process_name=watchdog_data.get("process_name", ""),
                 process_path=watchdog_data.get("process_path", ""),
@@ -218,6 +230,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.window_keyword = settings.window_keyword
         self.scheduler_settings = settings.scheduler
         self.human_settings = settings.human_behavior
+        self.telegram_token = settings.telegram_token
+        self.telegram_chat_id = settings.telegram_chat_id
+        self.dry_run = settings.dry_run
+
+        self.notifier = Notifier(self.webhook_url)
+        self.telegram_bot = TelegramBot(self.telegram_token, self.telegram_chat_id)
+        self.input_handler = InputHandler(dry_run=self.dry_run, logger=self._append_log)
+        self.safety_lock = SafetyLock(
+            self.input_handler, notifier=self.notifier, telegram_bot=self.telegram_bot, logger=self._append_log
+        )
 
         self.hotkey_handles: list[str] = []
         self.is_running = False
@@ -487,6 +509,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.webhook_field.editingFinished.connect(self._on_webhook_changed)
         form.addRow("Webhook URL", self.webhook_field)
 
+        self.telegram_token_field = QtWidgets.QLineEdit(self.telegram_token)
+        self.telegram_token_field.setPlaceholderText("Telegram bot token")
+        self.telegram_token_field.editingFinished.connect(self._on_telegram_changed)
+        form.addRow("Telegram token", self.telegram_token_field)
+
+        self.telegram_chat_field = QtWidgets.QLineEdit(self.telegram_chat_id)
+        self.telegram_chat_field.setPlaceholderText("Chat ID")
+        self.telegram_chat_field.editingFinished.connect(self._on_telegram_changed)
+        form.addRow("Telegram chat", self.telegram_chat_field)
+
+        self.dry_run_checkbox = QtWidgets.QCheckBox("Enable dry-run (no real input)")
+        self.dry_run_checkbox.setChecked(self.dry_run)
+        self.dry_run_checkbox.stateChanged.connect(self._on_dry_run_changed)
+        form.addRow("Simulation", self.dry_run_checkbox)
+
         test_button = QtWidgets.QPushButton("Send test message")
         test_button.clicked.connect(self._send_test_webhook)
         form.addRow("", test_button)
@@ -523,6 +560,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_hotkey = settings.start_hotkey
         self.stop_hotkey = settings.stop_hotkey
         self.webhook_url = settings.webhook_url
+        self.telegram_token = settings.telegram_token
+        self.telegram_chat_id = settings.telegram_chat_id
+        self.dry_run = settings.dry_run
         self.watchdog_settings = settings.watchdog
         self.overlay_settings = settings.overlay
         self.human_settings = settings.human_behavior
@@ -536,6 +576,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_button.setText(f"Start ({self.start_hotkey})")
         self.stop_button.setText(f"Stop ({self.stop_hotkey})")
         self.webhook_field.setText(self.webhook_url)
+        self.telegram_token_field.setText(self.telegram_token)
+        self.telegram_chat_field.setText(self.telegram_chat_id)
+        self.dry_run_checkbox.blockSignals(True)
+        self.dry_run_checkbox.setChecked(self.dry_run)
+        self.dry_run_checkbox.blockSignals(False)
 
         self.process_name_field.setText(self.watchdog_settings.process_name)
         self.process_path_field.setText(self.watchdog_settings.process_path)
@@ -578,6 +623,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.auto_save_box.blockSignals(True)
         self.auto_save_box.setChecked(self.auto_save)
         self.auto_save_box.blockSignals(False)
+
+        self.notifier.webhook_url = self.webhook_url
+        self.telegram_bot = TelegramBot(self.telegram_token, self.telegram_chat_id)
+        self.safety_lock.telegram_bot = self.telegram_bot
+        self.input_handler.set_dry_run(self.dry_run)
 
         self.settings_dirty = False
         self._update_title_dirty()
@@ -776,7 +826,12 @@ class MainWindow(QtWidgets.QMainWindow):
     # Scheduler orchestration --------------------------------------------
     def _start_scheduler(self, windows: list[window_manager.WindowInfo]) -> None:
         self._stop_scheduler()
-        self.scheduler_thread = SchedulerThread(windows, self.scheduler_settings, action_callback=self._perform_action)
+        self.scheduler_thread = SchedulerThread(
+            windows,
+            self.scheduler_settings,
+            action_callback=self._perform_action,
+            safety_lock=self.safety_lock,
+        )
         self.scheduler_thread.window_started.connect(
             lambda idx, title: self._append_log(f"Switched to '{title}'", prefix=self._client_prefix(idx))
         )
@@ -798,6 +853,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _perform_action(self, info: window_manager.WindowInfo, idx: int) -> None:
         del info
+        if self.safety_lock.locked:
+            self._append_log("Safety lock active; awaiting resume", prefix=self._client_prefix(idx))
+            return
         self._append_log("Analyzing frame and dispatching actions…", prefix=self._client_prefix(idx))
 
     def _client_prefix(self, index: int) -> str:
@@ -821,6 +879,9 @@ class MainWindow(QtWidgets.QMainWindow):
             start_hotkey=self.start_hotkey,
             stop_hotkey=self.stop_hotkey,
             webhook_url=self.webhook_url,
+            telegram_token=self.telegram_token,
+            telegram_chat_id=self.telegram_chat_id,
+            dry_run=self.dry_run,
             watchdog=self.watchdog_settings,
             overlay=self.overlay_settings,
             window_keyword=self.window_keyword,
@@ -857,8 +918,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_webhook_changed(self) -> None:
         self.webhook_url = self.webhook_field.text().strip()
+        self.notifier.webhook_url = self.webhook_url
         self._mark_dirty()
-        self._append_log("Webhook URL updated.")
+
+    def _on_telegram_changed(self) -> None:
+        self.telegram_token = self.telegram_token_field.text().strip()
+        self.telegram_chat_id = self.telegram_chat_field.text().strip()
+        self.telegram_bot = TelegramBot(self.telegram_token, self.telegram_chat_id)
+        self.safety_lock.telegram_bot = self.telegram_bot
+        self._mark_dirty()
+
+    def _on_dry_run_changed(self, state: int) -> None:
+        del state
+        self.dry_run = self.dry_run_checkbox.isChecked()
+        self.input_handler.set_dry_run(self.dry_run)
+        self._mark_dirty()
+        self._append_log("Dry-run mode toggled.")
 
     def _send_test_webhook(self) -> None:
         notifier = Notifier(self.webhook_url)
