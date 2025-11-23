@@ -12,5 +12,8 @@ Portable Python-based automation tool for legacy DirectX applications. The proje
 2. Run the GUI directly: `python -m core.main`.
 3. Execute the launcher: `python -m launcher.main --owner <org> --repo <repo>`.
 
+### Quick validation
+- Run a bytecode compilation sweep to catch syntax issues early: `python -m compileall src build_launcher.py build_core.py build_final.py`.
+
 ## Packaging
 Nuitka defaults are defined in `pyproject.toml` to create portable binaries (`standalone` mode). Build commands can be wired into GitHub Actions to publish zipped assets (`core.zip`) consumed by the launcher.
