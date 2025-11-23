@@ -5,7 +5,17 @@ import json
 from pathlib import Path
 from typing import Iterable
 
-from core.fsm import ActionState, ErrorState, IdleState, SearchingState, StateContext, StateMachine
+from core.fsm import (
+    ActionState,
+    ErrorState,
+    HumanBehaviorSettings,
+    IdleState,
+    NoiseState,
+    RestingState,
+    SearchingState,
+    StateContext,
+    StateMachine,
+)
 from core.input_handler import InputHandler
 from core.ocr_engine import OCREngine
 from core.vision import TemplateMatchResult, TemplateMatcher
@@ -77,18 +87,24 @@ def run_ocr(region: tuple[int, int, int, int], numeric: bool = False) -> None:
         print(f"Text OCR result: {text}")
 
 
-def run_state_machine(matcher: TemplateMatcher, handler: InputHandler, notifier: Notifier) -> None:
+def run_state_machine(
+    matcher: TemplateMatcher, handler: InputHandler, notifier: Notifier, human: HumanBehaviorSettings
+) -> None:
     states = {
         "idle": IdleState(),
         "search": SearchingState(),
         "action": ActionState(),
         "error": ErrorState(),
+        "resting": RestingState(),
+        "noise": NoiseState(),
     }
 
     def logger(message: str) -> None:
         print(message)
 
-    context = StateContext(matcher=matcher, controller=handler, notifier=notifier, logger=logger)
+    context = StateContext(
+        matcher=matcher, controller=handler, notifier=notifier, logger=logger, human_behavior=human
+    )
     machine = StateMachine(initial_state="idle", states=states, sleep_interval=0.1)
     machine.run(context)
 
@@ -101,6 +117,9 @@ def main() -> None:
     parser.add_argument("--click-first", action="store_true", help="Move and click the best match center")
     parser.add_argument("--ocr-region", type=str, help="OCR region as x,y,w,h")
     parser.add_argument("--ocr-number", action="store_true", help="Parse OCR output as number")
+    parser.add_argument("--rest-interval", type=float, nargs=2, metavar=("MIN", "MAX"), default=(40, 60))
+    parser.add_argument("--rest-duration", type=float, nargs=2, metavar=("MIN", "MAX"), default=(1, 5))
+    parser.add_argument("--noise-chance", type=float, default=0.015, help="Micro-noise probability per loop")
     args = parser.parse_args()
 
     if args.ocr_region:
@@ -120,7 +139,14 @@ def main() -> None:
             input_handler.click(x, y)
         return
 
-    run_state_machine(matcher, input_handler, notifier)
+    human = HumanBehaviorSettings(
+        rest_interval_min_minutes=args.rest_interval[0],
+        rest_interval_max_minutes=args.rest_interval[1],
+        rest_duration_min_minutes=args.rest_duration[0],
+        rest_duration_max_minutes=args.rest_duration[1],
+        micro_noise_chance=args.noise_chance,
+    )
+    run_state_machine(matcher, input_handler, notifier, human)
 
 
 if __name__ == "__main__":

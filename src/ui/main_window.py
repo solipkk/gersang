@@ -9,6 +9,7 @@ from pathlib import Path
 import keyboard
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from core.fsm import HumanBehaviorSettings
 from core import window_manager
 from core.scheduler import SchedulerSettings, SchedulerThread
 from core.watchdog import WatchdogConfig, WatchdogThread
@@ -70,6 +71,7 @@ class AppSettings:
     overlay: OverlaySettings = field(default_factory=OverlaySettings)
     window_keyword: str = "game"
     scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
+    human_behavior: HumanBehaviorSettings = field(default_factory=HumanBehaviorSettings)
 
     def to_dict(self) -> dict:
         return {
@@ -85,6 +87,14 @@ class AppSettings:
             "scheduler": {
                 "switch_delay": self.scheduler.switch_delay,
                 "action_delay": self.scheduler.action_delay,
+            },
+            "human_behavior": {
+                "rest_interval_min_minutes": self.human_behavior.rest_interval_min_minutes,
+                "rest_interval_max_minutes": self.human_behavior.rest_interval_max_minutes,
+                "rest_duration_min_minutes": self.human_behavior.rest_duration_min_minutes,
+                "rest_duration_max_minutes": self.human_behavior.rest_duration_max_minutes,
+                "micro_noise_chance": self.human_behavior.micro_noise_chance,
+                "noise_keys": list(self.human_behavior.noise_keys),
             },
         }
 
@@ -105,6 +115,7 @@ class AppSettings:
         overlay_data = data.get("overlay", {}) or {}
         window_manager_data = data.get("window_manager", {}) or {}
         scheduler_data = data.get("scheduler", {}) or {}
+        human_behavior = data.get("human_behavior", {}) or {}
 
         return cls(
             targets=targets,
@@ -121,6 +132,14 @@ class AppSettings:
             scheduler=SchedulerSettings(
                 switch_delay=float(scheduler_data.get("switch_delay", 0.2)),
                 action_delay=float(scheduler_data.get("action_delay", 0.5)),
+            ),
+            human_behavior=HumanBehaviorSettings(
+                rest_interval_min_minutes=float(human_behavior.get("rest_interval_min_minutes", 40)),
+                rest_interval_max_minutes=float(human_behavior.get("rest_interval_max_minutes", 60)),
+                rest_duration_min_minutes=float(human_behavior.get("rest_duration_min_minutes", 1)),
+                rest_duration_max_minutes=float(human_behavior.get("rest_duration_max_minutes", 5)),
+                micro_noise_chance=float(human_behavior.get("micro_noise_chance", 0.015)),
+                noise_keys=tuple(human_behavior.get("noise_keys", ("i", "s"))),
             ),
         )
 
@@ -198,6 +217,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scheduler_settings = settings.scheduler
         self.window_keyword = settings.window_keyword
         self.scheduler_settings = settings.scheduler
+        self.human_settings = settings.human_behavior
 
         self.hotkey_handles: list[str] = []
         self.is_running = False
@@ -228,6 +248,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self._build_window_panel())
         layout.addLayout(self._build_target_section())
         layout.addWidget(self._build_settings_section())
+        layout.addWidget(self._build_human_section())
         layout.addWidget(self._build_control_section())
         layout.addWidget(self._build_watchdog_section())
         layout.addWidget(self._build_notification_section())
@@ -355,6 +376,45 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_settings_enabled(False)
         return group
 
+    def _build_human_section(self) -> QtWidgets.QGroupBox:
+        group = QtWidgets.QGroupBox("Humanization")
+        form = QtWidgets.QFormLayout(group)
+
+        interval_row = QtWidgets.QHBoxLayout()
+        self.rest_interval_min_spin = QtWidgets.QDoubleSpinBox()
+        self.rest_interval_min_spin.setRange(0.0, 240.0)
+        self.rest_interval_min_spin.setSuffix(" min min")
+        self.rest_interval_min_spin.valueChanged.connect(self._on_human_changed)
+        self.rest_interval_max_spin = QtWidgets.QDoubleSpinBox()
+        self.rest_interval_max_spin.setRange(0.0, 240.0)
+        self.rest_interval_max_spin.setSuffix(" min max")
+        self.rest_interval_max_spin.valueChanged.connect(self._on_human_changed)
+        interval_row.addWidget(self.rest_interval_min_spin)
+        interval_row.addWidget(self.rest_interval_max_spin)
+        form.addRow("Rest interval", interval_row)
+
+        duration_row = QtWidgets.QHBoxLayout()
+        self.rest_duration_min_spin = QtWidgets.QDoubleSpinBox()
+        self.rest_duration_min_spin.setRange(0.1, 60.0)
+        self.rest_duration_min_spin.setSuffix(" min min")
+        self.rest_duration_min_spin.valueChanged.connect(self._on_human_changed)
+        self.rest_duration_max_spin = QtWidgets.QDoubleSpinBox()
+        self.rest_duration_max_spin.setRange(0.1, 60.0)
+        self.rest_duration_max_spin.setSuffix(" min max")
+        self.rest_duration_max_spin.valueChanged.connect(self._on_human_changed)
+        duration_row.addWidget(self.rest_duration_min_spin)
+        duration_row.addWidget(self.rest_duration_max_spin)
+        form.addRow("Rest duration", duration_row)
+
+        self.noise_chance_spin = QtWidgets.QDoubleSpinBox()
+        self.noise_chance_spin.setRange(0.0, 10.0)
+        self.noise_chance_spin.setSingleStep(0.1)
+        self.noise_chance_spin.setSuffix(" %")
+        self.noise_chance_spin.valueChanged.connect(self._on_human_changed)
+        form.addRow("Micro-noise chance", self.noise_chance_spin)
+
+        return group
+
     def _build_control_section(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
         layout = QtWidgets.QHBoxLayout(panel)
@@ -465,6 +525,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.webhook_url = settings.webhook_url
         self.watchdog_settings = settings.watchdog
         self.overlay_settings = settings.overlay
+        self.human_settings = settings.human_behavior
 
         self.is_running = False
         self.run_start_time = None
@@ -489,6 +550,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.action_delay_spin.blockSignals(True)
         self.action_delay_spin.setValue(float(self.scheduler_settings.action_delay))
         self.action_delay_spin.blockSignals(False)
+        self.rest_interval_min_spin.blockSignals(True)
+        self.rest_interval_min_spin.setValue(float(self.human_settings.rest_interval_min_minutes))
+        self.rest_interval_min_spin.blockSignals(False)
+        self.rest_interval_max_spin.blockSignals(True)
+        self.rest_interval_max_spin.setValue(float(self.human_settings.rest_interval_max_minutes))
+        self.rest_interval_max_spin.blockSignals(False)
+        self.rest_duration_min_spin.blockSignals(True)
+        self.rest_duration_min_spin.setValue(float(self.human_settings.rest_duration_min_minutes))
+        self.rest_duration_min_spin.blockSignals(False)
+        self.rest_duration_max_spin.blockSignals(True)
+        self.rest_duration_max_spin.setValue(float(self.human_settings.rest_duration_max_minutes))
+        self.rest_duration_max_spin.blockSignals(False)
+        self.noise_chance_spin.blockSignals(True)
+        self.noise_chance_spin.setValue(float(self.human_settings.micro_noise_chance * 100))
+        self.noise_chance_spin.blockSignals(False)
         self._scan_windows()
 
         self.overlay_checkbox.blockSignals(True)
@@ -749,6 +825,7 @@ class MainWindow(QtWidgets.QMainWindow):
             overlay=self.overlay_settings,
             window_keyword=self.window_keyword,
             scheduler=self.scheduler_settings,
+            human_behavior=self.human_settings,
         )
 
     def _save_profile(self) -> None:
@@ -850,6 +927,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scheduler_settings = SchedulerSettings(
             switch_delay=float(self.switch_delay_spin.value()),
             action_delay=float(self.action_delay_spin.value()),
+        )
+        self._mark_dirty()
+
+    def _on_human_changed(self) -> None:
+        if getattr(self, "loading_profile", False):
+            return
+        self.human_settings = HumanBehaviorSettings(
+            rest_interval_min_minutes=float(self.rest_interval_min_spin.value()),
+            rest_interval_max_minutes=float(self.rest_interval_max_spin.value()),
+            rest_duration_min_minutes=float(self.rest_duration_min_spin.value()),
+            rest_duration_max_minutes=float(self.rest_duration_max_spin.value()),
+            micro_noise_chance=float(self.noise_chance_spin.value() / 100.0),
+            noise_keys=self.human_settings.noise_keys,
         )
         self._mark_dirty()
 
