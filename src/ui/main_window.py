@@ -9,6 +9,8 @@ from pathlib import Path
 import keyboard
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from core import window_manager
+from core.scheduler import SchedulerSettings, SchedulerThread
 from core.watchdog import WatchdogConfig, WatchdogThread
 from utils.notifier import Notifier
 from ui.overlay import OverlayWidget
@@ -66,6 +68,8 @@ class AppSettings:
     webhook_url: str = ""
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     overlay: OverlaySettings = field(default_factory=OverlaySettings)
+    window_keyword: str = "game"
+    scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
 
     def to_dict(self) -> dict:
         return {
@@ -77,6 +81,11 @@ class AppSettings:
             "webhook_url": self.webhook_url,
             "watchdog": self.watchdog.__dict__,
             "overlay": self.overlay.to_dict(),
+            "window_manager": {"keyword": self.window_keyword},
+            "scheduler": {
+                "switch_delay": self.scheduler.switch_delay,
+                "action_delay": self.scheduler.action_delay,
+            },
         }
 
     @classmethod
@@ -94,6 +103,8 @@ class AppSettings:
         hotkeys = data.get("hotkeys", {})
         watchdog_data = data.get("watchdog", {}) or {}
         overlay_data = data.get("overlay", {}) or {}
+        window_manager_data = data.get("window_manager", {}) or {}
+        scheduler_data = data.get("scheduler", {}) or {}
 
         return cls(
             targets=targets,
@@ -106,6 +117,11 @@ class AppSettings:
                 hang_timeout_minutes=int(watchdog_data.get("hang_timeout_minutes", 5)),
             ),
             overlay=OverlaySettings.from_dict(overlay_data),
+            window_keyword=window_manager_data.get("keyword", "game"),
+            scheduler=SchedulerSettings(
+                switch_delay=float(scheduler_data.get("switch_delay", 0.2)),
+                action_delay=float(scheduler_data.get("action_delay", 0.5)),
+            ),
         )
 
 
@@ -178,6 +194,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.webhook_url = settings.webhook_url
         self.watchdog_settings = settings.watchdog
         self.overlay_settings = settings.overlay
+        self.window_keyword = settings.window_keyword
+        self.scheduler_settings = settings.scheduler
+        self.window_keyword = settings.window_keyword
+        self.scheduler_settings = settings.scheduler
 
         self.hotkey_handles: list[str] = []
         self.is_running = False
@@ -188,6 +208,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.watchdog_thread: WatchdogThread | None = None
         self.overlay_widget: OverlayWidget | None = None
+        self.scheduler_thread: SchedulerThread | None = None
 
         self._build_ui()
         self._load_targets_into_list()
@@ -204,6 +225,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setSpacing(12)
 
         layout.addLayout(self._build_profile_section())
+        layout.addWidget(self._build_window_panel())
         layout.addLayout(self._build_target_section())
         layout.addWidget(self._build_settings_section())
         layout.addWidget(self._build_control_section())
@@ -234,6 +256,50 @@ class MainWindow(QtWidgets.QMainWindow):
             layout.addWidget(widget)
 
         return layout
+
+    def _build_window_panel(self) -> QtWidgets.QGroupBox:
+        group = QtWidgets.QGroupBox("Window targets")
+        vbox = QtWidgets.QVBoxLayout(group)
+
+        header = QtWidgets.QHBoxLayout()
+        self.window_keyword_field = QtWidgets.QLineEdit(self.window_keyword)
+        self.window_keyword_field.setPlaceholderText("Title keyword (e.g. Maple)")
+        self.window_keyword_field.editingFinished.connect(self._on_window_keyword_changed)
+        refresh_button = QtWidgets.QPushButton("Refresh")
+        refresh_button.clicked.connect(self._scan_windows)
+        header.addWidget(QtWidgets.QLabel("Keyword"))
+        header.addWidget(self.window_keyword_field)
+        header.addWidget(refresh_button)
+        vbox.addLayout(header)
+
+        self.window_list = QtWidgets.QListWidget()
+        self.window_list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.window_list.setAlternatingRowColors(True)
+        vbox.addWidget(self.window_list)
+
+        controls = QtWidgets.QHBoxLayout()
+        select_all = QtWidgets.QPushButton("Select all")
+        select_all.clicked.connect(lambda: self._toggle_all_windows(True))
+        deselect_all = QtWidgets.QPushButton("Deselect all")
+        deselect_all.clicked.connect(lambda: self._toggle_all_windows(False))
+
+        self.switch_delay_spin = QtWidgets.QDoubleSpinBox()
+        self.switch_delay_spin.setRange(0.0, 5.0)
+        self.switch_delay_spin.setSingleStep(0.05)
+        self.switch_delay_spin.setSuffix(" s switch")
+        self.switch_delay_spin.valueChanged.connect(self._on_scheduler_changed)
+        self.action_delay_spin = QtWidgets.QDoubleSpinBox()
+        self.action_delay_spin.setRange(0.0, 5.0)
+        self.action_delay_spin.setSingleStep(0.05)
+        self.action_delay_spin.setSuffix(" s action")
+        self.action_delay_spin.valueChanged.connect(self._on_scheduler_changed)
+
+        for widget in (select_all, deselect_all, self.switch_delay_spin, self.action_delay_spin):
+            controls.addWidget(widget)
+        controls.addStretch(1)
+        vbox.addLayout(controls)
+
+        return group
 
     def _build_target_section(self) -> QtWidgets.QLayout:
         container = QtWidgets.QHBoxLayout()
@@ -416,6 +482,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hang_timeout_spin.setValue(int(self.watchdog_settings.hang_timeout_minutes))
         self.hang_timeout_spin.blockSignals(False)
 
+        self.window_keyword_field.setText(self.window_keyword)
+        self.switch_delay_spin.blockSignals(True)
+        self.switch_delay_spin.setValue(float(self.scheduler_settings.switch_delay))
+        self.switch_delay_spin.blockSignals(False)
+        self.action_delay_spin.blockSignals(True)
+        self.action_delay_spin.setValue(float(self.scheduler_settings.action_delay))
+        self.action_delay_spin.blockSignals(False)
+        self._scan_windows()
+
         self.overlay_checkbox.blockSignals(True)
         self.overlay_checkbox.setChecked(self.overlay_settings.enabled)
         self.overlay_checkbox.blockSignals(False)
@@ -442,6 +517,35 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if self.targets:
             self.target_list.setCurrentRow(0)
+
+    # Window discovery ----------------------------------------------------
+    def _scan_windows(self) -> None:
+        keyword = self.window_keyword_field.text().strip()
+        windows = window_manager.find_all_windows(keyword) if keyword else []
+        self.window_list.clear()
+        for info in windows:
+            item = QtWidgets.QListWidgetItem(f"{info.title} ({info.hwnd})")
+            item.setData(QtCore.Qt.UserRole, info)
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.Unchecked)
+            self.window_list.addItem(item)
+        self._append_log(f"Found {len(windows)} window(s) matching '{keyword}'.")
+
+    def _toggle_all_windows(self, checked: bool) -> None:
+        state = QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked
+        for i in range(self.window_list.count()):
+            item = self.window_list.item(i)
+            item.setCheckState(state)
+
+    def _selected_windows(self) -> list[window_manager.WindowInfo]:
+        selected: list[window_manager.WindowInfo] = []
+        for i in range(self.window_list.count()):
+            item = self.window_list.item(i)
+            if item.checkState() == QtCore.Qt.Checked:
+                info = item.data(QtCore.Qt.UserRole)
+                if isinstance(info, window_manager.WindowInfo):
+                    selected.append(info)
+        return window_manager.filter_windows(selected)
 
     def _refresh_item_text(self, index: int) -> None:
         item = self.target_list.item(index)
@@ -572,11 +676,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.targets:
             self._append_log("No targets configured; cannot start.")
             return
+        windows = self._selected_windows()
+        if not windows:
+            self._append_log("No windows selected; refresh and choose targets to control.")
+            return
         self.is_running = True
         self.status_label.setText("Status: running")
         self.run_start_time = time.monotonic()
         self._update_overlay_content("running")
         self._append_log("Macro started.")
+        self._start_scheduler(windows)
 
     def _handle_stop(self) -> None:
         if not self.is_running:
@@ -586,6 +695,48 @@ class MainWindow(QtWidgets.QMainWindow):
         self.run_start_time = None
         self._update_overlay_content("idle")
         self._append_log("Macro stopped.")
+        self._stop_scheduler()
+
+    # Scheduler orchestration --------------------------------------------
+    def _start_scheduler(self, windows: list[window_manager.WindowInfo]) -> None:
+        self._stop_scheduler()
+        self.scheduler_thread = SchedulerThread(windows, self.scheduler_settings, action_callback=self._perform_action)
+        self.scheduler_thread.window_started.connect(
+            lambda idx, title: self._append_log(f"Switched to '{title}'", prefix=self._client_prefix(idx))
+        )
+        self.scheduler_thread.render_timeout.connect(
+            lambda idx, title: self._append_log("Skipped due to blank frame after switch.", prefix=self._client_prefix(idx))
+        )
+        self.scheduler_thread.window_removed.connect(
+            lambda idx, title: self._append_log(f"Window closed: {title}", prefix=self._client_prefix(idx))
+        )
+        self.scheduler_thread.log.connect(self._append_log)
+        self.scheduler_thread.finished.connect(self._on_scheduler_finished)
+        self.scheduler_thread.start()
+
+    def _stop_scheduler(self) -> None:
+        if self.scheduler_thread:
+            self.scheduler_thread.stop()
+            self.scheduler_thread.wait()
+            self.scheduler_thread = None
+
+    def _perform_action(self, info: window_manager.WindowInfo, idx: int) -> None:
+        del info
+        self._append_log("Analyzing frame and dispatching actions…", prefix=self._client_prefix(idx))
+
+    def _client_prefix(self, index: int) -> str:
+        return f"[Client {index + 1}] "
+
+    def _on_scheduler_finished(self) -> None:
+        if self.scheduler_thread:
+            self.scheduler_thread = None
+        if not self.is_running:
+            return
+        self.is_running = False
+        self.status_label.setText("Status: idle")
+        self.run_start_time = None
+        self._update_overlay_content("idle")
+        self._append_log("Scheduler finished.")
 
     # Persistence ----------------------------------------------------------
     def _current_settings(self) -> AppSettings:
@@ -596,6 +747,8 @@ class MainWindow(QtWidgets.QMainWindow):
             webhook_url=self.webhook_url,
             watchdog=self.watchdog_settings,
             overlay=self.overlay_settings,
+            window_keyword=self.window_keyword,
+            scheduler=self.scheduler_settings,
         )
 
     def _save_profile(self) -> None:
@@ -615,10 +768,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._save_profile()
 
     # Logging --------------------------------------------------------------
-    def _append_log(self, message: str) -> None:
+    def _append_log(self, message: str, prefix: str = "") -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
-        line = f"[{timestamp}] {message}"
-        self.last_log_line = message
+        line = f"[{timestamp}] {prefix}{message}"
+        self.last_log_line = f"{prefix}{message}".strip()
         self.log_console.appendPlainText(line)
         self.log_console.verticalScrollBar().setValue(self.log_console.verticalScrollBar().maximum())
         if self.watchdog_thread:
@@ -682,6 +835,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.watchdog_thread.restarted.connect(lambda path: self._append_log(f"Restarted: {path}"))
         self.watchdog_thread.killed.connect(lambda name: self._append_log(f"Killed hung process: {name}"))
         self.watchdog_thread.start()
+
+    # Window & scheduler handlers ----------------------------------------
+    def _on_window_keyword_changed(self) -> None:
+        if getattr(self, "loading_profile", False):
+            return
+        self.window_keyword = self.window_keyword_field.text().strip()
+        self._mark_dirty()
+        self._scan_windows()
+
+    def _on_scheduler_changed(self) -> None:
+        if getattr(self, "loading_profile", False):
+            return
+        self.scheduler_settings = SchedulerSettings(
+            switch_delay=float(self.switch_delay_spin.value()),
+            action_delay=float(self.action_delay_spin.value()),
+        )
+        self._mark_dirty()
 
     # Watchdog / overlay handlers ----------------------------------------
     def _on_watchdog_changed(self) -> None:
@@ -781,6 +951,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.auto_save:
             self._save_profile()
         self._unregister_hotkeys()
+        self._stop_scheduler()
         if self.watchdog_thread:
             self.watchdog_thread.stop()
             self.watchdog_thread.wait()
