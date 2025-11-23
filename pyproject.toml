@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gersang-rpa"
+version = "0.1.0"
+description = "Portable RPA toolkit for legacy DirectX games"
+authors = [{name = "Automation Team"}]
+dependencies = [
+    "PySide6==6.7.2",
+    "opencv-python==4.9.0.80",
+    "pydirectinput==1.0.4",
+    "mss==9.0.1",
+    "requests==2.31.0",
+]
+requires-python = ">=3.10"
+
+[tool.nuitka]
+# Common Nuitka settings for building portable binaries.
+follow-imports = true
+onefile = false
+standalone = true
+windows-console-mode = "disable"
+assume-yes-for-downloads = true
+output-dir = "build"
