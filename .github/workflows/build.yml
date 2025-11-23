@@ -1,0 +1,45 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt nuitka
+
+      - name: Build Launcher
+        run: python build_launcher.py
+
+      - name: Build Core
+        run: python build_core.py
+
+      - name: Prepare release archive
+        shell: pwsh
+        run: |
+          Remove-Item -Path release -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path release | Out-Null
+          Copy-Item -Path "dist/Launcher.exe" -Destination release/
+          Copy-Item -Path "dist/core" -Destination "release/core" -Recurse
+          Compress-Archive -Path release/* -DestinationPath Release.zip -Force
+
+      - name: Upload Release asset
+        uses: softprops/action-gh-release@v1
+        with:
+          files: Release.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
